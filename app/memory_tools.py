@@ -1,108 +1,293 @@
+
+"""Provide SQLite retrieval tools for the Main Chat Agent."""
+
 import json
 from typing import Any
+
 from langchain_core.tools import tool
+
 from app.database import Database
 
 
 def build_memory_tools(
     db: Database,
-    conversation_id: str,
+    session_id: str,
 ) -> list[Any]:
-    """Build memory tools scoped to a single conversation.
+    """Build session-specific message retrieval tools.
 
     Args:
-        db (Database): Database instance containing conversation history.
-        conversation_id (str): Identifier of the active conversation.
+        db (Database): SQLite database manager.
+        session_id (str): Active session identifier.
 
     Returns:
-        list[Any]: LangChain tools for historical memory retrieval.
+        list[Any]: Numbered lookup and search tools.
     """
 
-    @tool(parse_docstring=True)
+    @tool
     def get_message_by_number(
         number: int,
         user_messages_only: bool = True,
     ) -> str:
-        """Retrieve an exact historical message by its position.
+        """Retrieve a numbered message from this session.
 
         Args:
-            number: One-based message position. Defaults to counting user
-                messages only, unless user_messages_only is false.
-            user_messages_only: If true, count only user-authored messages.
-                If false, count both user and assistant messages.
+            number: One-based message position.
+            user_messages_only: Count only user messages when true.
 
         Returns:
-            A JSON string containing the message, or a not-found result.
+            JSON containing the matching message or a not-found result.
         """
-        message = db.get_message_by_number(
-            conversation_id=conversation_id,
-            number=number,
-            user_messages_only=user_messages_only,
-        )
+        try:
+            record = db.get_message_by_number(
+                session_id=session_id,
+                number=number,
+                user_messages_only=user_messages_only,
+            )
 
-        if message is None:
+            if record is None:
+                return json.dumps({
+                    "found": False,
+                    "message": "No message found at that position.",
+                })
+
+            return json.dumps({
+                "found": True,
+                "message": record,
+            }, ensure_ascii=False)
+
+        except ValueError as exc:
             return json.dumps({
                 "found": False,
-                "message": f"No message found at position {number}.",
+                "error": str(exc),
             })
 
-        return json.dumps({
-            "found": True,
-            "message": message,
-        }, ensure_ascii=False)
-
-    @tool(parse_docstring=True)
-    def search_conversation(query: str, limit: int = 10) -> str:
-        """Search stored conversation messages for a text phrase.
+    @tool
+    def search_conversation(
+        query: str,
+        limit: int = 10,
+    ) -> str:
+        """Search messages from the active session.
 
         Args:
-            query: Word or phrase to search for in the transcript.
-            limit: Maximum number of matching messages to return.
+            query: Text to search for in stored messages.
+            limit: Maximum number of results.
 
         Returns:
-            A JSON string containing matching messages or a no-results result.
+            JSON containing matching messages.
         """
-        messages = db.search_messages(
-            conversation_id=conversation_id,
-            query=query,
-            limit=limit,
-        )
+        try:
+            results = db.search_messages(
+                session_id=session_id,
+                query=query,
+                limit=limit,
+            )
 
-        if not messages:
+            return json.dumps({
+                "found": bool(results),
+                "results": results,
+            }, ensure_ascii=False)
+
+        except ValueError as exc:
             return json.dumps({
                 "found": False,
                 "results": [],
-                "message": "No matching messages were found.",
+                "error": str(exc),
             })
-
-        return json.dumps({
-            "found": True,
-            "results": messages,
-        }, ensure_ascii=False)
-
-    @tool(parse_docstring=True)
-    def get_conversation_summary() -> str:
-        """Retrieve the saved rolling summary of this conversation.
-
-        Returns:
-            A JSON string containing the summary and its covered turn number.
-        """
-        summary = db.get_summary(conversation_id)
-
-        if summary is None:
-            return json.dumps({
-                "found": False,
-                "message": "Conversation summary was not found.",
-            })
-
-        return json.dumps({
-            "found": True,
-            "summary": summary["rolling_summary"],
-            "summary_through_turn": summary["summary_through_turn"],
-        }, ensure_ascii=False)
 
     return [
         get_message_by_number,
         search_conversation,
-        get_conversation_summary,
     ]
+
+# import json
+# from typing import Any
+# from langchain_core.tools import tool
+# from app.database import Database
+
+
+# def build_memory_tools(
+#     db: Database,
+#     conversation_id: str,
+#     session_start_turn: int = 1,
+# ) -> list[Any]:
+#     """Build memory tools restricted to the active session.
+
+#     Args:
+#         db (Database): Database containing conversation history.
+#         conversation_id (str): Active conversation identifier.
+#         session_start_turn (int): First turn belonging to the
+#             current active session.
+
+#     Returns:
+#         list[Any]: LangChain tools for session-only retrieval.
+
+#     Raises:
+#         ValueError: If session_start_turn is less than 1.
+#     """
+#     if session_start_turn < 1:
+#         raise ValueError(
+#             "session_start_turn must be at least 1"
+#         )
+
+#     @tool(parse_docstring=True)
+#     def get_message_by_number(
+#         number: int,
+#         user_messages_only: bool = True,
+#     ) -> str:
+#         """Retrieve a numbered message from the active session.
+
+#         Args:
+#             number: One-based message position within the
+#                 current session.
+#             user_messages_only: If true, count user messages
+#                 only. Otherwise count user and assistant messages.
+
+#         Returns:
+#             A JSON string containing the message or a not-found result.
+#         """
+#         if number < 1:
+#             return json.dumps({
+#                 "found": False,
+#                 "message": "Message number must be at least 1.",
+#             })
+
+#         role_filter = (
+#             "AND role = 'user'"
+#             if user_messages_only
+#             else ""
+#         )
+
+#         with db._connect() as connection:
+#             row = connection.execute(
+#                 f"""
+#                 SELECT
+#                     message_number,
+#                     turn_number,
+#                     role,
+#                     content,
+#                     created_at
+#                 FROM messages
+#                 WHERE conversation_id = ?
+#                   AND turn_number >= ?
+#                   {role_filter}
+#                 ORDER BY message_number
+#                 LIMIT 1 OFFSET ?
+#                 """,
+#                 (
+#                     conversation_id,
+#                     session_start_turn,
+#                     number - 1,
+#                 ),
+#             ).fetchone()
+
+#         if row is None:
+#             return json.dumps({
+#                 "found": False,
+#                 "message": (
+#                     f"No message found at session position {number}."
+#                 ),
+#             })
+
+#         return json.dumps({
+#             "found": True,
+#             "message": dict(row),
+#         }, ensure_ascii=False)
+
+#     @tool(parse_docstring=True)
+#     def search_conversation(
+#         query: str,
+#         limit: int = 10,
+#     ) -> str:
+#         """Search messages within the active session.
+
+#         Args:
+#             query: Word or phrase to search for.
+#             limit: Maximum number of matching messages.
+
+#         Returns:
+#             A JSON string containing matching session messages.
+#         """
+#         if not query.strip():
+#             return json.dumps({
+#                 "found": False,
+#                 "results": [],
+#                 "message": "Search query cannot be empty.",
+#             })
+
+#         if limit < 1:
+#             return json.dumps({
+#                 "found": False,
+#                 "results": [],
+#                 "message": "Search limit must be at least 1.",
+#             })
+
+#         with db._connect() as connection:
+#             rows = connection.execute(
+#                 """
+#                 SELECT
+#                     message_number,
+#                     turn_number,
+#                     role,
+#                     content,
+#                     created_at
+#                 FROM messages
+#                 WHERE conversation_id = ?
+#                   AND turn_number >= ?
+#                   AND instr(lower(content), lower(?)) > 0
+#                 ORDER BY message_number
+#                 LIMIT ?
+#                 """,
+#                 (
+#                     conversation_id,
+#                     session_start_turn,
+#                     query.strip(),
+#                     limit,
+#                 ),
+#             ).fetchall()
+
+#         messages = [
+#             dict(row)
+#             for row in rows
+#         ]
+
+#         if not messages:
+#             return json.dumps({
+#                 "found": False,
+#                 "results": [],
+#                 "message": (
+#                     "No matching messages were found "
+#                     "in the active session."
+#                 ),
+#             })
+
+#         return json.dumps({
+#             "found": True,
+#             "results": messages,
+#         }, ensure_ascii=False)
+
+#     @tool(parse_docstring=True)
+#     def get_conversation_summary() -> str:
+#         """Retrieve the active session's conversation summary.
+
+#         Returns:
+#             A JSON string containing an active-session summary
+#             or a message explaining its unavailability.
+#         """
+#         # Rolling summaries are currently disabled.
+#         # A previously saved summary may contain information
+#         # from an earlier session, so it must not be exposed.
+#         return json.dumps({
+#             "found": False,
+#             "summary": "",
+#             "summary_through_turn": 0,
+#             "message": (
+#                 "Session summaries are disabled in "
+#                 "selective short-term memory mode."
+#             ),
+#         })
+
+#     return [
+#         get_message_by_number,
+#         search_conversation,
+#         get_conversation_summary,
+#     ]

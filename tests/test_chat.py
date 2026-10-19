@@ -1,4 +1,6 @@
 
+"""Test chat persistence and selective-memory behavior."""
+
 from langchain_core.messages import AIMessage
 
 from app import chat as chat_module
@@ -6,131 +8,185 @@ from app.database import Database
 
 
 class FakeAgent:
-    """Provide a predictable response for chat tests.
+    """Simulate the Main Agent without calling Groq."""
 
-    Attributes:
-        response (str): Answer returned by the fake agent.
-
-    Functions:
-        invoke: Return a simulated assistant response.
-    """
-
-    def __init__(self, response: str) -> None:
-        """Initialize the fake agent.
+    def invoke(self, payload, config=None):
+        """Return a deterministic assistant response.
 
         Args:
-            response (str): Answer to return.
-        """
-        self.response = response
-
-    def invoke(self, state: dict, config: dict | None) -> dict:
-        """Return a simulated agent result.
-
-        Args:
-            state (dict): Input conversation state.
+            payload (dict): Agent input messages.
+            config (dict | None): Optional invocation configuration.
 
         Returns:
-            dict: Simulated assistant messages.
+            dict: Simulated agent result.
         """
         return {
-            "messages": state["messages"] + [
-                AIMessage(content=self.response)
+            "messages": [
+                AIMessage(content="Hello! How can I help?")
             ]
         }
 
 
 def mock_build_agents(db, conversation_id):
-    """Build fake agents for chat tests."""
+    """Build fake agents for isolated chat tests.
+
+    Args:
+        db (Database): Test database.
+        conversation_id (str): Conversation identifier.
+
+    Returns:
+        dict: Fake Main Agent mapping.
+    """
     return {
-        "main_agent": FakeAgent("Hello! I can help."),
-        "memory_agent": FakeAgent("Memory result."),
-        "memory_tools": [],
+        "main_agent": FakeAgent(),
     }
 
 
+def setup_chat_mocks(monkeypatch, decision="SKIP"):
+    """Replace external services with deterministic test doubles.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        decision (str): Simulated memory classification.
+    """
+    monkeypatch.setattr(
+        chat_module,
+        "build_agents",
+        mock_build_agents,
+    )
+
+    monkeypatch.setattr(
+        chat_module,
+        "get_trace_handler",
+        lambda: None,
+    )
+
+    monkeypatch.setattr(
+        chat_module,
+        "process_memory_turn",
+        lambda **kwargs: {
+            "decision": decision,
+            "fact_key": None,
+            "fact_value": None,
+        },
+    )
+
+
 def test_chat_saves_both_messages(tmp_path, monkeypatch):
+    """Verify that user and assistant messages are saved in SQLite."""
+    setup_chat_mocks(monkeypatch)
+
     db = Database(str(tmp_path / "test.db"))
 
-    monkeypatch.setattr(
-        chat_module,
-        "build_agents",
-        mock_build_agents,
+    result = chat_module.chat(
+        db=db,
+        message="Hi",
     )
-
-    # Prevent the test from running real summarization.
-    monkeypatch.setattr(
-        chat_module,
-        "update_rolling_summary",
-        lambda *args, **kwargs: None,
-    )
-
-    result = chat_module.chat(db, "Hello")
-
-    assert result["answer"] == "Hello! I can help."
-    assert result["turn_number"] == 1
 
     conversation_id = result["conversation_id"]
-    turns = db.get_recent_turns(conversation_id, limit=10)
 
-    assert len(turns) == 2
-    assert turns[0]["role"] == "user"
-    assert turns[0]["content"] == "Hello"
-    assert turns[1]["role"] == "assistant"
-    assert turns[1]["content"] == "Hello! I can help."
-
-
-def test_chat_attempts_summary_update(tmp_path, monkeypatch):
-    db = Database(str(tmp_path / "test.db"))
-    summary_calls = []
-
-    monkeypatch.setattr(
-        chat_module,
-        "build_agents",
-        mock_build_agents,
+    user_message = db.get_message_by_number(
+        conversation_id,
+        1,
     )
 
-    def fake_update_summary(*args, **kwargs):
-        summary_calls.append((args, kwargs))
-        return "Updated summary."
-
-    monkeypatch.setattr(
-        chat_module,
-        "update_rolling_summary",
-        fake_update_summary,
+    assistant_message = db.get_message_by_number(
+        conversation_id,
+        2,
+        user_messages_only=False,
     )
 
-    result = chat_module.chat(db, "Hello")
+    assert user_message is not None
+    assert assistant_message is not None
 
-    assert result["answer"] == "Hello! I can help."
-    assert len(summary_calls) == 1
+    assert user_message["role"] == "user"
+    assert user_message["content"] == "Hi"
+    assert user_message["turn_number"] == 1
 
-
-def test_chat_survives_summary_update_failure(tmp_path, monkeypatch):
-    db = Database(str(tmp_path / "test.db"))
-
-    monkeypatch.setattr(
-        chat_module,
-        "build_agents",
-        mock_build_agents,
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["content"] == (
+        "Hello! How can I help?"
     )
+    assert assistant_message["turn_number"] == 1
 
-    def failing_summary_update(*args, **kwargs):
-        raise RuntimeError("Simulated summarization failure")
-
-    monkeypatch.setattr(
-        chat_module,
-        "update_rolling_summary",
-        failing_summary_update,
+    assert result["answer"] == (
+        "Hello! How can I help?"
     )
-
-    result = chat_module.chat(db, "Hello")
-
-    assert result["answer"] == "Hello! I can help."
     assert result["turn_number"] == 1
 
-    conversation_id = result["conversation_id"]
-    turns = db.get_recent_turns(conversation_id, limit=10)
 
-    assert len(turns) == 2
-    assert turns[0]["content"] == "Hello"
-    assert turns[1]["content"] == "Hello! I can help."
+def test_chat_processes_selective_memory(tmp_path, monkeypatch):
+    """Verify that selective-memory classification is invoked."""
+    setup_chat_mocks(monkeypatch, decision="SAVE")
+
+    db = Database(str(tmp_path / "test.db"))
+
+    result = chat_module.chat(
+        db=db,
+        message="I use Groq for my chatbot.",
+    )
+
+    assert result["memory_decision"] is not None
+    assert result["memory_decision"]["decision"] == "SAVE"
+    assert result["memory_error"] is None
+
+    # Rolling summaries must remain disabled in selective mode.
+    assert result["summary_update"]["updated"] is False
+    assert result["summary_update"]["disabled"] is True
+
+
+def test_chat_survives_memory_extraction_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Verify that extraction failures do not discard chat responses."""
+    setup_chat_mocks(monkeypatch)
+
+    def failing_memory_extraction(**kwargs):
+        """Simulate a memory extraction failure.
+
+        Args:
+            **kwargs: Memory extraction arguments.
+
+        Raises:
+            RuntimeError: Always, to simulate an extraction error.
+        """
+        raise RuntimeError("Simulated extraction failure")
+
+    monkeypatch.setattr(
+        chat_module,
+        "process_memory_turn",
+        failing_memory_extraction,
+    )
+
+    db = Database(str(tmp_path / "test.db"))
+
+    result = chat_module.chat(
+        db=db,
+        message="Hello",
+    )
+
+    assert result["answer"] == (
+        "Hello! How can I help?"
+    )
+
+    assert result["memory_decision"] is None
+
+    assert result["memory_error"] is not None
+    assert "Simulated extraction failure" in (
+        result["memory_error"]
+    )
+
+    # The assistant message must remain saved even if
+    # selective-memory extraction fails.
+    assistant_message = db.get_message_by_number(
+        result["conversation_id"],
+        2,
+        user_messages_only=False,
+    )
+
+    assert assistant_message is not None
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["content"] == (
+        "Hello! How can I help?"
+    )
